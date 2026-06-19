@@ -104,7 +104,7 @@ async def startup_event():
         print("✅ AccountService ready.")
 
         # ── Per-asset market workers ──────────────────────────────────────
-        for asset in ["btc", "eth", "sol"]:
+        for asset in ["btc", "eth"]:
             print(f"Initializing {asset.upper()} Bot...")
             bots.append(_MarketWorker(asset, account))
             print(f"✅ {asset.upper()} Bot initialized")
