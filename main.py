@@ -396,7 +396,7 @@ async def api_history(period: str = "1D"):
     # Single source of truth for validation/dedup/chronology. This is the
     # same function used before every Redis write, so the data shown on the
     # chart is held to the same standard as the data actually persisted.
-    merged = sanitize_portfolio_history(merged, drop_isolated_spikes=True)
+    merged = sanitize_portfolio_history(merged, drop_isolated_spikes=True, collapse_flat_runs=True)
 
     # Forward-fill gaps > 5 min to keep the equity curve continuous
     # even during idle periods between trades.

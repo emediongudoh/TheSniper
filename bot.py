@@ -216,6 +216,27 @@ MAX_HISTORY_POINTS    = 60_000          # ~1 year at 1 pt per 10 min
 # All assets the bot tracks across every worker.
 _ALL_ASSETS = ["btc", "eth", "sol", "xrp"]
 
+# ── Flat-period snapshot throttling ───────────────────────────────────────
+# ROOT CAUSE OF "CHART KEEPS GROWING WITH IDENTICAL VALUES":
+# portfolio_history_snapshot() used to unconditionally append a brand new
+# {t, v} point every time it was called — once per completed trade (every
+# market round) AND once every 60 s from main.py's idle-period heartbeat
+# loop — even when the value had not changed at all since the previous
+# point. Over weeks of mostly-flat PnL this writes thousands of points that
+# are visually and informationally identical, bloating Redis storage and the
+# /api/history payload without adding any real information.
+#
+# Fix: a new point is only ever persisted when EITHER
+#   (a) the value actually changed by more than PORTFOLIO_FLAT_EPSILON, or
+#   (b) at least PORTFOLIO_HEARTBEAT_SEC has elapsed since the last stored
+#       point (so the curve still visibly extends to "now" during long
+#       flat stretches instead of looking like the bot stopped).
+# This is enforced once, centrally, inside portfolio_history_snapshot() —
+# every caller (per-trade writes from log_pnl, and the 60-s idle heartbeat
+# in main.py) automatically benefits with no per-call-site logic needed.
+PORTFOLIO_FLAT_EPSILON  = float(os.getenv("PORTFOLIO_FLAT_EPSILON",  "0.005"))   # half a cent
+PORTFOLIO_HEARTBEAT_SEC = int(os.getenv("PORTFOLIO_HEARTBEAT_SEC", "1800"))      # 30 minutes
+
 # ── Process-wide worker registry ──────────────────────────────────────────
 # ROOT CAUSE OF CHART SPIKES (see notes above portfolio_history_snapshot):
 # log_pnl() used to push *one asset's* cumulative_pnl into the shared,
@@ -275,7 +296,14 @@ def _is_finite_number(v: Any) -> bool:
         return False
 
 
-def sanitize_portfolio_history(points: List[Dict], *, drop_isolated_spikes: bool = True) -> List[Dict]:
+def sanitize_portfolio_history(
+    points: List[Dict],
+    *,
+    drop_isolated_spikes: bool = True,
+    collapse_flat_runs: bool = False,
+    flat_epsilon: float = PORTFOLIO_FLAT_EPSILON,
+    min_flat_run: int = 3,
+) -> List[Dict]:
     """
     Single source of truth for cleaning a portfolio-history point list before
     it is either persisted to Redis or served to the chart.
@@ -289,10 +317,16 @@ def sanitize_portfolio_history(points: List[Dict], *, drop_isolated_spikes: bool
         far away from both neighbors and then jumps right back, which is the
         exact signature of a one-off corrupted write landing between two
         otherwise-correct totals.
+      • Optionally collapses "flat runs": three or more consecutive points
+        whose values are all within flat_epsilon of each other are reduced
+        to just their first and last point. Two points are always enough to
+        render a flat horizontal segment, so this is lossless for charting
+        while sharply bounding storage/payload growth during long periods
+        with no PnL change.
 
-    This function is intentionally conservative about the spike filter —
-    genuine, large, sustained portfolio swings are never removed, only
-    single-point spike-and-revert artifacts.
+    This function is intentionally conservative — genuine, large, sustained
+    portfolio swings are never removed or altered, only redundant duplicate
+    points and one-off corrupted spikes.
     """
     cleaned: Dict[int, float] = {}
     for p in points:
@@ -321,7 +355,49 @@ def sanitize_portfolio_history(points: List[Dict], *, drop_isolated_spikes: bool
     if drop_isolated_spikes and len(ordered) >= 3:
         ordered = _drop_isolated_spikes(ordered)
 
+    if collapse_flat_runs and len(ordered) >= min_flat_run:
+        ordered = compress_flat_runs(ordered, epsilon=flat_epsilon, min_run=min_flat_run)
+
     return ordered
+
+
+def compress_flat_runs(points: List[Dict], epsilon: float = PORTFOLIO_FLAT_EPSILON,
+                        min_run: int = 3) -> List[Dict]:
+    """
+    Collapse runs of 3-or-more consecutive points whose values are all within
+    `epsilon` of the run's first value down to just the first and last point
+    of that run.
+
+    Why this is safe / lossless for rendering: a straight horizontal line
+    segment is fully described by its two endpoints. Any interior points
+    with (effectively) the same value add nothing visually — the SVG line
+    drawn through 50 identical points looks pixel-identical to the line
+    drawn through just the first and last of them. Short runs (1-2 points)
+    are left untouched since there's nothing to compress.
+
+    This is applied both when persisting to Redis (keeps stored history
+    compact as it grows) and when serving /api/history (keeps the JSON
+    payload small even if older, pre-compaction data is still in Redis).
+    """
+    n = len(points)
+    if n < min_run:
+        return list(points)
+
+    out: List[Dict] = []
+    i = 0
+    while i < n:
+        j = i
+        base_v = points[i]["v"]
+        while j + 1 < n and abs(points[j + 1]["v"] - base_v) <= epsilon:
+            j += 1
+        run_len = j - i + 1
+        if run_len >= min_run:
+            out.append(points[i])
+            out.append(points[j])
+        else:
+            out.extend(points[i:j + 1])
+        i = j + 1
+    return out
 
 
 def _drop_isolated_spikes(points: List[Dict]) -> List[Dict]:
@@ -517,7 +593,9 @@ def portfolio_history_backfill() -> int:
     # Step 4: merge with existing (already-sanitized) history
     # Existing points that post-date the last backfill point (live snapshots
     # recorded since previous deploy) are preserved; backfill replaces older pts.
-    existing_history = sanitize_portfolio_history(existing_history, drop_isolated_spikes=False)
+    existing_history = sanitize_portfolio_history(
+        existing_history, drop_isolated_spikes=False, collapse_flat_runs=True,
+    )
     last_backfill_t = backfill_curve[-1]["t"] if backfill_curve else 0
     live_tail = [p for p in existing_history if p["t"] > last_backfill_t]
 
@@ -530,6 +608,7 @@ def portfolio_history_backfill() -> int:
     final_curve = sanitize_portfolio_history(
         [{"t": ts, "v": v} for ts, v in sorted(merged.items())],
         drop_isolated_spikes=False,
+        collapse_flat_runs=True,
     )
 
     # Cap to max points
@@ -592,9 +671,24 @@ def _mark_round_written(round_key: Optional[str]) -> None:
         _recent_round_writes[round_key] = t.time()
 
 
+def _is_flat_update(last_point: Optional[Dict], new_v: float, now_ms: int) -> bool:
+    """
+    True when this write would be a redundant duplicate of the last stored
+    point: the value hasn't meaningfully changed AND the heartbeat interval
+    hasn't elapsed yet. This is the core of the "only write when something
+    actually changed" fix — see PORTFOLIO_FLAT_EPSILON / PORTFOLIO_HEARTBEAT_SEC
+    above for the full rationale.
+    """
+    if not last_point:
+        return False
+    value_unchanged = abs(new_v - last_point["v"]) <= PORTFOLIO_FLAT_EPSILON
+    heartbeat_due    = (now_ms - last_point["t"]) >= (PORTFOLIO_HEARTBEAT_SEC * 1000)
+    return value_unchanged and not heartbeat_due
+
+
 def portfolio_history_snapshot(total_pnl: float, round_key: Optional[str] = None) -> bool:
     """
-    Append one live {t, v} snapshot to Redis immediately.
+    Record one live portfolio-equity observation.
 
     Called by MarketWorker.log_pnl() right after every completed trade so the
     chart updates the moment a market round closes — no background flush delay.
@@ -614,9 +708,18 @@ def portfolio_history_snapshot(total_pnl: float, round_key: Optional[str] = None
                 _ROUND_DEDUP_TTL_SEC is ignored — this is the "only one valid
                 snapshot per market round" safeguard.
 
-    Returns True on success (including a successful no-op skip for a
-    duplicate round_key — there is nothing left to do, which counts as
-    success), False on a real failure.
+    IMPORTANT — this does NOT always write a new point. A new {t, v} point is
+    only ever persisted to Redis when:
+        (a) the value changed by more than PORTFOLIO_FLAT_EPSILON since the
+            last stored point, or
+        (b) at least PORTFOLIO_HEARTBEAT_SEC has elapsed since the last
+            stored point (so the curve keeps visibly extending to "now"
+            during long flat stretches instead of stopping dead).
+    Calls that are pure no-ops because of (a)/(b) failing still return True —
+    "nothing needed to change" is a success, not a failure.
+
+    Returns True on success (including no-op skips for duplicate round_keys
+    or flat/unchanged values), False on a real failure.
     """
     if not _is_finite_number(total_pnl):
         print(f"⚠️ portfolio_history_snapshot rejected non-finite value: {total_pnl!r}")
@@ -633,19 +736,42 @@ def portfolio_history_snapshot(total_pnl: float, round_key: Optional[str] = None
     with _history_write_lock:
         try:
             existing: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
-            existing = sanitize_portfolio_history(existing, drop_isolated_spikes=False)
+            existing = sanitize_portfolio_history(
+                existing, drop_isolated_spikes=False, collapse_flat_runs=True,
+            )
             now_ms = int(t.time() * 1000)
             new_v  = round(float(total_pnl), 4)
+            last_point = existing[-1] if existing else None
 
             # Avoid near-duplicate timestamps: if the last point is within
             # 2 s just update it in place rather than adding a near-zero-
-            # width vertical segment.
-            if existing and (now_ms - existing[-1]["t"]) < 2000:
+            # width vertical segment. This takes priority over the flat-
+            # update check below since it represents the same instant, not
+            # a separate observation.
+            if last_point and (now_ms - last_point["t"]) < 2000:
                 existing[-1]["v"] = new_v
+                changed = True
+            elif _is_flat_update(last_point, new_v, now_ms):
+                # ── THE FIX ───────────────────────────────────────────────
+                # Value is unchanged from the last stored point and the
+                # heartbeat interval hasn't elapsed — skip the write
+                # entirely. No Redis round-trip, no new duplicate point.
+                changed = False
             else:
                 existing.append({"t": now_ms, "v": new_v})
+                changed = True
 
-            existing = sanitize_portfolio_history(existing, drop_isolated_spikes=False)
+            if not changed:
+                _mark_round_written(round_key)
+                return True
+
+            # Re-sanitize AND collapse any flat runs before writing, so
+            # stored history stays compact as it grows even in edge cases
+            # the write-gate above doesn't catch (e.g. historical data
+            # merged in from elsewhere).
+            existing = sanitize_portfolio_history(
+                existing, drop_isolated_spikes=False, collapse_flat_runs=True,
+            )
 
             if len(existing) > MAX_HISTORY_POINTS:
                 existing = existing[-MAX_HISTORY_POINTS:]
@@ -664,12 +790,15 @@ def portfolio_history_get(period: str = "ALL") -> List[Dict]:
     Fetch portfolio history filtered to the requested period.
     period: '1D' | '1W' | '1M' | '1Y' | 'ALL'
     Returns list of {t: unix_ms, v: pnl} dicts, oldest-first, fully
-    sanitized (validated, de-duplicated, strictly chronological, with
-    isolated single-point spikes removed).
+    sanitized (validated, de-duplicated, strictly chronological, isolated
+    single-point spikes removed, and long flat runs collapsed to their two
+    boundary points).
     Always returns at least the most recent point as a baseline.
     """
     raw_pts: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
-    all_pts = sanitize_portfolio_history(raw_pts, drop_isolated_spikes=True)
+    all_pts = sanitize_portfolio_history(
+        raw_pts, drop_isolated_spikes=True, collapse_flat_runs=True,
+    )
 
     if not all_pts or period.upper() == "ALL":
         return all_pts
